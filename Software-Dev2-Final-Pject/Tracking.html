@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Tracking</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f2f2f2;
+            color: #333;
+        }
+
+        h2 {
+            text-align: center;
+            margin-top: 20px;
+            margin-bottom: 20px;
+        }
+
+        #trackingForm, #orderDetails {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 20px;
+            border: 1px solid #ccc;
+            background-color: #fff;
+            border-radius: 5px;
+        }
+
+        label, input {
+            display: block;
+            margin-bottom: 10px;
+            width: 100%;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        .order-info {
+            margin-top: 20px;
+            display: none;
+        }
+
+        .order-info h3 {
+            color: #333;
+            font-size: 1.2em;
+        }
+
+        .order-info p {
+            font-size: 0.9em;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Order Tracking</h2>
+
+<!-- Tracking Form -->
+<div id="trackingForm">
+    <label for="orderID">Enter your Order ID:</label>
+    <input type="text" id="orderID" placeholder="e.g., 12345" required>
+    <button onclick="trackOrder()">Track Order</button>
+</div>
+
+<!-- Order Details Section -->
+<div id="orderDetails" class="order-info">
+    <h3>Order Status</h3>
+    <p><strong>Order ID:</strong> <span id="displayOrderID"></span></p>
+    <p><strong>Status:</strong> <span id="displayStatus"></span></p>
+    <p><strong>Expected Delivery:</strong> <span id="displayDeliveryDate"></span></p>
+</div>
+
+<script>
+        // Sample data for demonstration
+        const orderData = {
+            '12345': { status: 'Shipped', deliveryDate: '2024-11-15' },
+            '67890': { status: 'Processing', deliveryDate: '2024-11-20' },
+            '11223': { status: 'Delivered', deliveryDate: '2024-11-05' },
+        };
+
+        // Function to track an order based on order ID input
+        function trackOrder() {
+            const orderID = document.getElementById('orderID').value.trim();
+            const orderDetails = document.getElementById('orderDetails');
+            const displayOrderID = document.getElementById('displayOrderID');
+            const displayStatus = document.getElementById('displayStatus');
+            const displayDeliveryDate = document.getElementById('displayDeliveryDate');
+
+            if (orderData[orderID]) {
+                // Display order details if found
+                displayOrderID.textContent = orderID;
+                displayStatus.textContent = orderData[orderID].status;
+                displayDeliveryDate.textContent = orderData[orderID].deliveryDate;
+                orderDetails.style.display = 'block';
+            } else {
+                // Show message if order not found
+                alert('Order ID not found. Please check and try again.');
+                orderDetails.style.display = 'none';
+            }
+        }
+    </script>
+
+</body>
+</html>

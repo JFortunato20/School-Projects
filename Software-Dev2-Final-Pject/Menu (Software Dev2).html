@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Goodfella's Menu</title>
+    <link rel="stylesheet" href="Menu.css">
+    <script src="menu.js" defer></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background-color:#C4A484;
+        }
+
+        header {
+            background-color: #333;
+            color: white;
+            text-align: center;
+            padding: 10px;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+
+        .menu-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            
+        }
+
+        .menu-container h2 {
+            text-decoration: underline;
+        }
+
+        .menu-section {
+            text-align: center;
+            width: 80%; /* Adjust the width as needed */
+            margin: 0 auto; /* Center the menu section */
+            margin-bottom: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-around;
+            
+        }
+
+        .menu-item {
+            border: 1px solid #C4A484;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px;
+            width: 250px;
+            cursor: pointer;
+        }
+
+        .menu-item:hover {
+            background-color: rgb(184, 137, 66);
+        }
+        .menu-item h3 {
+        text-decoration: underline;
+        }
+
+        .menu-item p {
+         text-decoration: none;
+        }
+
+
+        .price {
+            font-weight: bold;
+            color: #000000;
+        }
+
+        #item-details {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: white;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            display: flex;
+            flex-direction: column;
+            align-items: left;
+            text-align: left;
+        }
+
+        #item-details.hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Goodfella's Menu</h1>
+    </header>
+    
+    <div class="menu-container">
+        <h2>Antipasto</h2>
+        <div class="menu-section">
+            <div class="menu-item" onclick="showDetails('Bruschetta', 'Toasted bread topped with fresh tomatoes, garlic, and basil.', '$7.99')">
+                <h3>Bruschetta</h3>
+                <p>Toasted bread topped with fresh tomatoes, garlic, and basil.</p>
+                <p class="price">$7.99</p>
+            </div>
+
+            <div class="menu-item" onclick="showDetails('Caprese Salad', 'Fresh mozzarella, tomatoes, and basil drizzled with balsamic glaze.', '$9.99')">
+                <h3>Caprese Salad</h3>
+                <p>Fresh mozzarella, tomatoes, and basil drizzled with balsamic glaze.</p>
+                <p class="price">$9.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Fried Calamari', 'Crispy fried calamari served with marinara sauce.', '$11.99')">
+                <h3>Fried Calamari</h3>
+                <p>Crispy fried calamari served with marinara sauce.</p>
+                <p class="price">$11.99</p>
+            </div>
+        
+            <div class="menu-item" onclick="showDetails('Crispy Mozzarella', 'Golden fried mozzarella sticks served with marinara sauce.', '$9.99')">
+                <h3>Crispy Mozzarella</h3>
+                <p>Golden fried mozzarella sticks served with marinara sauce.</p>
+                <p class="price">$9.99</p>
+            </div>
+        
+            <div class="menu-item" onclick="showDetails('Brick Oven Garlic Bread', 'Freshly baked garlic bread from our brick oven.', '$6.99')">
+                <h3>Brick Oven Garlic Bread</h3>
+                <p>Freshly baked garlic bread from our brick oven.</p>
+                <p class="price">$6.99</p>
+            </div>
+        
+            <div class="menu-item" onclick="showDetails('Mussels and Marinara', 'Fresh mussels cooked in flavorful marinara sauce.', '$12.99')">
+                <h3>Mussels and Marinara</h3>
+                <p>Fresh mussels cooked in flavorful marinara sauce.</p>
+                <p class="price">$12.99</p>
+            </div>
+        
+            <div class="menu-item" onclick="showDetails('Hot Sausage and Peppers', 'Spicy Italian sausage with sautéed peppers and onions.', '$10.99')">
+                <h3>Hot Sausage and Peppers</h3>
+                <p>Spicy Italian sausage with sautéed peppers and onions.</p>
+                <p class="price">$10.99</p>
+            </div>
+        
+            <div class="menu-item" onclick="showDetails('Baked Clams', 'Fresh clams baked with seasoned breadcrumbs and herbs.', '$13.99')">
+                <h3>Baked Clams</h3>
+                <p>Fresh clams baked with seasoned breadcrumbs and herbs.</p>
+                <p class="price">$13.99</p>
+            </div>
+
+            
+        </div>
+    </div>
+
+    <div class="menu-container">
+        <h2>Entrée</h2>
+        <div class="menu-section">
+            <div class="menu-item" onclick="showDetails('Spaghetti Bolognese', 'Classic Italian meat sauce served over spaghetti.', '$14.99')">
+                <h3>Spaghetti Bolognese</h3>
+                <p>Classic Italian meat sauce served over spaghetti.</p>
+                <p class="price">$14.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Florentine Steak', 'Served with Potatoes and Steak Fries', '$39.99')">
+                <h3>Florentine Steak</h3>
+                <p>Served with Potatoes and Steak Fries.</p>
+                <p class="price">$39.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Pasta al Forno', 'Meat sauce with a touch of butter, cream, and pecorino remano.', '$18.99')">
+                <h3>Pasta al Forno</h3>
+                <p>Meat sauce with a touch of butter, cream, and pecorino remano.</p>
+                <p class="price">$18.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Pasta Carbonara', 'Cream sauce with pancetta and remano cheese.', '$18.99')">
+                <h3>Pasta Carbonara</h3>
+                <p>Cream sauce with pancetta and remano cheese.</p>
+                <p class="price">$18.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Penne alla Vodka', 'Homemade Bolognese sauce with a touch of cream.', '$17.99')">
+                <h3>Penne alla Vodka</h3>
+                <p>Homemade Bolognese sauce with a touch of cream.</p>
+                <p class="price">$17.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Fresh Pappardelle', 'Roasted Peppers, Plum Tomato Sauce, Sautéed Onions, Artisanal Sausage, Herbed Ricotta.', '$20.99')">
+                <h3>Fresh Pappardelle</h3>
+                <p>Roasted Peppers, Plum Tomato Sauce, Sautéed Onions, Artisanal Sausage, Herbed Ricotta.</p>
+                <p class="price">$20.99</p>
+            </div>
+
+            <div class="menu-item" onclick="showDetails('Pasta Fagiolo', 'Hearty Tuscan Bean Soup with Ditalini Pasta and Parmigiano', '$10.99')">
+                <h3>Pasta Fagioli</h3>
+                <p>(Contains Pork) Hearty Tuscan Bean Soup with Ditalini Pasta and Parmigiano.</p>
+                <p class="price">$10.99</p>
+            </div>
+
+            <div class="menu-item" onclick="showDetails('Create Your Own Pizza', 'Choose from one of the following to add to a Margherita pizza. (ALL ADD ONS are 2$)               Pepperoni, Sausage, Ham, Bacon, Roasted Mushrooms, Carmelized Onions, Fresh Tomatoes, Spinach, Roasted Garlic, Broccoli.')">
+                <h3>Create Your Own Pizza</h3>
+                <p>Choose from one of the following to add to a Margherita pizza: Pepperoni, Sausage, Ham, Bacon, Roasted Mushrooms, Carmelized Onions, Fresh Tomatos, Spinach, Roasted Garlic, Broccoli.</p>
+                <p class="price">All add on's are 2$</p>
+            </div>
+
+            <div class="menu-item" onclick="showDetails('Margherita Pizza', 'Torn Basil, Plum Tomato Sauce, Mozzarella Cheese and Parmigiano', '$13.99')">
+                <h3>Margherita Pizza</h3>
+                <p>Torn Basil, Plum Tomato Sauce, Mozzarella Cheese and Parmigiano.</p>
+                <p class="price">$13.99</p>
+            </div>
+
+            <div class="menu-item" onclick="showDetails('Meatball Pizza', 'Sliced Meatballs, San Marzano Tomato Sauce, Herbed Ricotta Cheese, Mozzarella', '$15.99')">
+                <h3>Meatball Pizza</h3>
+                <p>Sliced Meatballs, San Marzano Tomato Sauce, Herbed Ricotta Cheese, Mozzarella.</p>
+                <p class="price">$13.99</p>
+            </div>
+            <div class="menu-item" onclick="showDetails('Grilled Chicken Pizza', 'Caramelized Onions, Artichoke Hearts, Calamata Olives, Fontina & Mozzarella Cheese.', '$16.99')">
+                <h3>Grilled Chicken Pizza</h3>
+                <p>Caramelized Onions, Artichoke Hearts, Calamata Olives, Fontina & Mozzarella Cheese.</p>
+                <p class="price">$16.99</p>
+            </div>
+                
+        </div>
+    <div>
+
+        <div class="menu-container">
+            <h2>Dessert</h2>
+            <div class="menu-section">
+                <div class="menu-item" onclick="showDetails('Tiramisu', 'Classic Italian dessert with layers of coffee-soaked ladyfingers and mascarpone cheese.', '$8.99')">
+                    <h3>Tiramisu</h3>
+                    <p>Classic Italian dessert with layers of coffee-soaked ladyfingers and mascarpone cheese.</p>
+                    <p class="price">$8.99</p>
+                </div>
+                <div class="menu-item" onclick="showDetails('Creme Brulee', 'Creamy Vanilla Bean Custard, Carmelized Sugar Crust.', '$6.99')">
+                    <h3>Creme Brulee</h3>
+                    <p>Creamy Vanilla Bean Custard, Carmelized Sugar Crust.</p>
+                    <p class="price">$6.99</p>
+                </div>
+                <div class="menu-item" onclick="showDetails('Cheese Cake', 'New York Style Cheesecake, Amarena Cherries.', '$12.99')">
+                    <h3>Cheese Cake</h3>
+                    <p>New York Style Cheesecake, Amarena Cherries.</p>
+                    <p class="price">$12.99</p>
+                </div>
+                <div class="menu-item" onclick="showDetails('Sorbet', 'Please ask your Server for our flavors.', '$5.99')">
+                    <h3>Sorbet</h3>
+                    <p>Please ask your Server for our flavors.</p>
+                    <p class="price">$5.99</p>
+                </div>
+                <div class="menu-item" onclick="showDetails('Cannoli', 'Three Flaky Shells Filled with Chocolate Chip Cannoli Cream.', '$6.99')">
+                    <h3>Cannoli</h3>
+                    <p>Three Flaky Shells Filled with Chocolate Chip Cannoli Cream.</p>
+                    <p class="price">$6.99</p>
+                </div>
+                <div class="menu-item" onclick="showDetails('Warm Chocolate Lava Cake', 'Individual Chocolate Souffle, Joe\'s Cappuccino Crunch Ice Cream.', '$11.99')">
+                    <h3>Warm Chocolate Lava Cake</h3>
+                    <p>Individual Chocolate Souffle, Joe's Cappuccino Crunch Ice Cream.</p>
+                    <p class="price">$11.99</p>
+                </div>
+            </div>
+        </div>
+    
+
+    <div id="item-details" class="hidden">
+        <h2 id="detail-title"></h2>
+        <p id="detail-description"></p>
+        <p id="detail-price"></p>
+        <button onclick="hideDetails()">Close</button>
+    </div>
+</body>
+</html>
