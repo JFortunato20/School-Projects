@@ -1,0 +1,447 @@
+/* ------------
+   deviceDriverDisk.ts
+
+   Backing-store / file-system device driver.
+------------ */
+var TSOS;
+(function (TSOS) {
+    class DeviceDriverDisk extends TSOS.DeviceDriver {
+        krnDiskDispatch;
+        blockSize;
+        constructor() {
+            super();
+            this.krnDiskDispatch = null;
+            this.driverEntry = this.krnDiskDriverEntry;
+            this.isr = this.krnDiskDispatch;
+            // safe default; override if _HardDrive is available
+            this.blockSize = (_HardDrive && typeof _HardDrive.getBlockSize === "function")
+                ? _HardDrive.getBlockSize()
+                : 64;
+        }
+        // -------- driver entry --------
+        krnDiskDriverEntry = () => {
+            this.status = "disk driver loaded";
+        };
+        // ========== helpers ==========
+        findFreeDirectoryBlock(hd) {
+            // directory track = 0, skip MBR at 0:0:0
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk && blk.used === 0) {
+                        return key;
+                    }
+                }
+            }
+            return null;
+        }
+        findFreeStorageBlock(hd) {
+            // data tracks = 1..3
+            for (let track = 1; track <= 3; track++) {
+                for (let sector = 0; sector <= 7; sector++) {
+                    for (let block = 0; block <= 7; block++) {
+                        const key = `${track}:${sector}:${block}`;
+                        const blk = hd.get(key);
+                        if (blk && blk.used === 0) {
+                            return key;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        // Turn a string (or already-hex string) into padded hex
+        convertStringToHex(str, padLength = 0) {
+            const isHex = /^[a-fA-F0-9]+$/.test(str);
+            if (isHex) {
+                return str.padEnd(padLength, "0").toUpperCase();
+            }
+            let hex = "";
+            for (let i = 0; i < str.length; i++) {
+                let charHex = str.charCodeAt(i).toString(16);
+                charHex = charHex.padStart(2, "0");
+                hex += charHex;
+            }
+            return hex.padEnd(padLength, "0").toUpperCase();
+        }
+        convertHexToString(hex) {
+            let str = "";
+            for (let i = 0; i < hex.length; i += 2) {
+                const hexByte = hex.substring(i, i + 2);
+                str += String.fromCharCode(parseInt(hexByte, 16));
+            }
+            return str;
+        }
+        getFileSize(startTSB, hd) {
+            let size = 0;
+            let currentTSB = startTSB;
+            while (currentTSB && currentTSB !== "0:0:0") {
+                const blockData = hd.get(currentTSB);
+                if (!blockData) {
+                    console.error(`Corrupted TSB chain starting at ${startTSB}`);
+                    return size;
+                }
+                size += blockData.data.replace(/0+$/, "").length / 2; // bytes
+                currentTSB = blockData.next;
+            }
+            return size;
+        }
+        getCreationDate(fileName) {
+            const metadata = window._FileMetadata?.[fileName];
+            return metadata?.creationDate || "Unknown";
+        }
+        // ========== public API used by the shell ==========
+        // shell "format"
+        format(_full = true) {
+            _HardDrive.initializeHardDrive();
+            // initializeHardDrive() calls persist() which refreshes UI
+            return true;
+        }
+        // shell "create <name>"
+        createFile(fileName) {
+            const paddedFileName = this.convertStringToHex(fileName, this.blockSize);
+            const hd = _HardDrive.getHardDriveMap();
+            const dirTSB = this.findFreeDirectoryBlock(hd);
+            const dataTSB = this.findFreeStorageBlock(hd);
+            if (!dirTSB || !dataTSB) {
+                return false;
+            }
+            // directory entry
+            hd.set(dirTSB, {
+                used: 1,
+                next: dataTSB,
+                data: paddedFileName.padEnd(this.blockSize, "0")
+            });
+            // first data block (empty for now)
+            hd.set(dataTSB, {
+                used: 1,
+                next: "0:0:0",
+                data: "0".repeat(this.blockSize)
+            });
+            // metadata
+            const meta = (window._FileMetadata ||= {});
+            if (!meta[fileName]) {
+                meta[fileName] = { creationDate: new Date().toISOString() };
+            }
+            _HardDrive.persist();
+            return true;
+        }
+        // shell "write <name> <data>"  (treat data as TEXT)
+        writeFile(targetFileName, data) {
+            const hd = _HardDrive.getHardDriveMap();
+            const paddedName = this.convertStringToHex(targetFileName, this.blockSize);
+            let dirKey = null;
+            let startTSB = null;
+            // locate directory entry
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const storedName = blk.data.substring(0, this.blockSize);
+                        if (storedName === paddedName) {
+                            dirKey = key;
+                            startTSB = blk.next;
+                            break;
+                        }
+                    }
+                }
+                if (dirKey)
+                    break;
+            }
+            if (!dirKey) {
+                console.error(`File "${targetFileName}" not found in the directory.`);
+                return false;
+            }
+            // convert text→hex and chunk by blockSize (characters)
+            const hex = this.convertStringToHex(data);
+            let dataPtr = 0;
+            let currentTSB = startTSB;
+            let prevTSB = null;
+            // reuse / extend the chain
+            while (dataPtr < hex.length) {
+                const chunk = hex.slice(dataPtr, dataPtr + this.blockSize);
+                if (!currentTSB || currentTSB === "0:0:0") {
+                    // need a new block
+                    currentTSB = this.findFreeStorageBlock(hd);
+                    if (!currentTSB) {
+                        console.error("Not enough space on disk to write the file.");
+                        return false;
+                    }
+                    if (prevTSB) {
+                        const prevBlk = hd.get(prevTSB);
+                        if (prevBlk) {
+                            prevBlk.next = currentTSB;
+                            hd.set(prevTSB, prevBlk);
+                        }
+                    }
+                    if (startTSB === "0:0:0" || startTSB === null) {
+                        const dirBlk = hd.get(dirKey);
+                        if (dirBlk) {
+                            dirBlk.next = currentTSB;
+                            hd.set(dirKey, dirBlk);
+                        }
+                        startTSB = currentTSB;
+                    }
+                }
+                hd.set(currentTSB, {
+                    used: 1,
+                    next: "0:0:0",
+                    data: chunk.padEnd(this.blockSize, "0")
+                });
+                prevTSB = currentTSB;
+                const blk = hd.get(currentTSB);
+                currentTSB = blk.next; // "0:0:0" until we override
+                dataPtr += this.blockSize;
+            }
+            // ensure last block has next="0:0:0"
+            if (prevTSB) {
+                const b = hd.get(prevTSB);
+                if (b) {
+                    b.next = "0:0:0";
+                    hd.set(prevTSB, b);
+                }
+            }
+            _HardDrive.persist();
+            return true;
+        }
+        // Used by Swapper: write raw bytes to file
+        writeRawDataToFile(targetFileName, data) {
+            const hd = _HardDrive.getHardDriveMap();
+            const paddedName = this.convertStringToHex(targetFileName, this.blockSize);
+            let dirKey = null;
+            let startTSB = null;
+            // locate directory entry
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const storedName = blk.data.substring(0, this.blockSize);
+                        if (storedName === paddedName) {
+                            dirKey = key;
+                            startTSB = blk.next;
+                            break;
+                        }
+                    }
+                }
+                if (dirKey)
+                    break;
+            }
+            if (!dirKey) {
+                console.error(`File "${targetFileName}" not found in the directory.`);
+                return false;
+            }
+            let dataPtr = 0;
+            let currentTSB = startTSB;
+            let prevTSB = null;
+            while (dataPtr < data.length) {
+                const chunk = data.slice(dataPtr, dataPtr + this.blockSize);
+                if (!currentTSB || currentTSB === "0:0:0") {
+                    currentTSB = this.findFreeStorageBlock(hd);
+                    if (!currentTSB) {
+                        console.error("Not enough space on disk to write the file.");
+                        return false;
+                    }
+                    if (prevTSB) {
+                        const prevBlk = hd.get(prevTSB);
+                        if (prevBlk) {
+                            prevBlk.next = currentTSB;
+                            hd.set(prevTSB, prevBlk);
+                        }
+                    }
+                    if (startTSB === "0:0:0" || startTSB === null) {
+                        const dirBlk = hd.get(dirKey);
+                        if (dirBlk) {
+                            dirBlk.next = currentTSB;
+                            hd.set(dirKey, dirBlk);
+                        }
+                        startTSB = currentTSB;
+                    }
+                }
+                const dataHex = chunk
+                    .map(b => b.toString(16).padStart(2, "0"))
+                    .join("")
+                    .padEnd(this.blockSize, "0");
+                hd.set(currentTSB, {
+                    used: 1,
+                    next: "0:0:0",
+                    data: dataHex
+                });
+                prevTSB = currentTSB;
+                const blk = hd.get(currentTSB);
+                currentTSB = blk.next;
+                dataPtr += this.blockSize;
+            }
+            if (prevTSB) {
+                const b = hd.get(prevTSB);
+                if (b) {
+                    b.next = "0:0:0";
+                    hd.set(prevTSB, b);
+                }
+            }
+            _HardDrive.persist();
+            return true;
+        }
+        // shell "read <name>"
+        readFile(targetFileName) {
+            const hd = _HardDrive.getHardDriveMap();
+            const padded = this.convertStringToHex(targetFileName, this.blockSize);
+            let startTSB = null;
+            // find directory entry
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const storedName = blk.data.substring(0, padded.length);
+                        if (storedName === padded) {
+                            startTSB = blk.next;
+                            break;
+                        }
+                    }
+                }
+                if (startTSB)
+                    break;
+            }
+            if (!startTSB || startTSB === "0:0:0") {
+                console.error(`File "${targetFileName}" not found in the directory.`);
+                return "";
+            }
+            let hexOut = "";
+            let cur = startTSB;
+            while (cur && cur !== "0:0:0") {
+                const blk = hd.get(cur);
+                if (!blk) {
+                    console.error(`Corrupted file chain for "${targetFileName}".`);
+                    return "";
+                }
+                hexOut += blk.data;
+                cur = blk.next;
+            }
+            // strip trailing zeros (padding)
+            hexOut = hexOut.replace(/0+$/, "");
+            return hexOut;
+        }
+        // shell "delete <name>"
+        deleteFile(fileName) {
+            const hd = _HardDrive.getHardDriveMap();
+            const padded = this.convertStringToHex(fileName, this.blockSize);
+            let dirKey = null;
+            let startTSB = null;
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const storedName = blk.data.substring(0, padded.length);
+                        if (storedName === padded) {
+                            dirKey = key;
+                            startTSB = blk.next;
+                            break;
+                        }
+                    }
+                }
+                if (dirKey)
+                    break;
+            }
+            if (!dirKey || !startTSB || startTSB === "0:0:0") {
+                //console.error(`File "${fileName}" not found in the directory.`);
+                return false;
+            }
+            // free directory block
+            const dirBlk = hd.get(dirKey);
+            if (dirBlk) {
+                dirBlk.used = 0;
+                dirBlk.next = "0:0:0";
+                // leave data (name) or clear it, up to you
+                hd.set(dirKey, dirBlk);
+            }
+            // free data chain
+            let cur = startTSB;
+            while (cur && cur !== "0:0:0") {
+                const blk = hd.get(cur);
+                if (!blk) {
+                    console.error(`Corrupted TSB chain for file "${fileName}".`);
+                    break;
+                }
+                const nextTSB = blk.next;
+                blk.used = 0;
+                blk.next = "0:0:0";
+                hd.set(cur, blk);
+                cur = nextTSB;
+            }
+            _HardDrive.persist();
+            return true;
+        }
+        // shell "ls" / "ls -a"
+        listFiles(showAll = false) {
+            const hd = _HardDrive.getHardDriveMap();
+            const files = [];
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const hexName = blk.data.substring(0, this.blockSize).replace(/0+$/, "");
+                        const name = this.convertHexToString(hexName);
+                        if (!showAll && name.startsWith(".")) {
+                            continue;
+                        }
+                        const startTSB = blk.next;
+                        const size = (startTSB && startTSB !== "0:0:0")
+                            ? this.getFileSize(startTSB, hd)
+                            : 0;
+                        const creationDate = this.getCreationDate(name);
+                        files.push({ name, size, creationDate });
+                    }
+                }
+            }
+            return files;
+        }
+        // ---- cp old new ----
+        copyFile(oldName, newName) {
+            const dataHex = this.readFile(oldName);
+            if (!dataHex)
+                return false;
+            const text = this.convertHexToString(dataHex);
+            if (!this.createFile(newName))
+                return false;
+            return this.writeFile(newName, text);
+        }
+        // ---- mv old new ----
+        renameFile(oldName, newName) {
+            const dataHex = this.readFile(oldName);
+            if (!dataHex)
+                return false;
+            const text = this.convertHexToString(dataHex);
+            if (!this.createFile(newName))
+                return false;
+            if (!this.writeFile(newName, text))
+                return false;
+            this.deleteFile(oldName);
+            return true;
+        }
+        // used by Swapper / debugging
+        findTSBByFilename(filename) {
+            const hd = _HardDrive.getHardDriveMap();
+            const padded = this.convertStringToHex(filename, this.blockSize);
+            for (let sector = 0; sector <= 7; sector++) {
+                for (let block = (sector === 0) ? 1 : 0; block <= 7; block++) {
+                    const key = `0:${sector}:${block}`;
+                    const blk = hd.get(key);
+                    if (blk?.used === 1) {
+                        const storedName = blk.data.substring(0, this.blockSize);
+                        if (storedName === padded) {
+                            return key;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+    }
+    TSOS.DeviceDriverDisk = DeviceDriverDisk;
+})(TSOS || (TSOS = {}));
+//# sourceMappingURL=deviceDriverDisk.js.map

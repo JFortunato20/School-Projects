@@ -1,0 +1,32 @@
+var TSOS;
+(function (TSOS) {
+    class Memory {
+        bytes;
+        init(size = 0x300) {
+            this.bytes = new Uint8Array(size);
+            this.bytes.fill(0x00);
+        }
+        read(addr) {
+            if (addr < 0 || addr >= this.bytes.length)
+                throw new Error("Memory OOB");
+            return this.bytes[addr];
+        }
+        write(addr, value) {
+            if (addr < 0 || addr >= this.bytes.length)
+                throw new Error("Memory OOB");
+            this.bytes[addr] = value & 0xFF;
+        }
+        dump() {
+            return this.bytes; // snapshot for UI
+        }
+        clear(base = 0x0000, limit = 0x00FF) {
+            // Fill [base, limit] (inclusive) with 0x00
+            const end = Math.min(this.dump().length - 1, limit);
+            for (let a = base; a <= end; a++) {
+                this.write(a, 0x00);
+            }
+        }
+    }
+    TSOS.Memory = Memory;
+})(TSOS || (TSOS = {}));
+//# sourceMappingURL=memory.js.map

@@ -1,0 +1,1049 @@
+/* ------------
+   Shell.ts
+
+   The OS Shell - The "command line interface" (CLI) for the console.
+
+    Note: While fun and learning are the primary goals of all enrichment center activities,
+          serious injuries may occur when trying to write your own Operating System.
+   ------------ */
+declare var _ProcessManager: any;
+
+
+declare var _DiskDriver: TSOS.DeviceDriverDisk;
+   // disk / file-system driver
+
+
+// TODO: Write a base class / prototype for system services and let Shell inherit from it.
+function hexToBytes(input: string): number[] {
+  return input
+    .trim()
+    .replace(/[,;\n\r]/g, " ")
+    .split(/\s+/)
+    .filter(tok => tok.length > 0)
+    .map(tok => parseInt(tok, 16))
+    .map(n => (Number.isFinite(n) ? (n & 0xFF) : 0));
+}
+
+function hexToAscii(hex: string): string {
+  let out = "";
+  // strip spaces just in case
+  hex = hex.replace(/\s+/g, "");
+  for (let i = 0; i < hex.length; i += 2) {
+    const byteHex = hex.substring(i, i + 2);
+    if (byteHex.length < 2) break;
+    const value = parseInt(byteHex, 16);
+    if (!Number.isFinite(value)) break;
+    out += String.fromCharCode(value);
+  }
+  return out;
+}
+
+
+(function ensureScheduler() {
+  if (!(window as any)._Scheduler) {
+    (window as any)._Scheduler = new TSOS.Scheduler();
+  }
+  // ensure the global var exists in this scope too
+  // @ts-ignore
+  _Scheduler = (window as any)._Scheduler;
+})();
+// ===== Strict program parsing & validation for TSOS opcodes =====
+const TSOS_ALLOWED_OPCODES = new Set<number>([
+  0xA9, 0xAD, 0x8D, 0x6D, 0xA2, 0xAE, 0xA0, 0xAC, 0xEA, 0x00, 0xEC, 0xD0, 0xEE, 0xFF
+]);
+
+function _tsosOperandBytes(op: number): number {
+  switch (op) {
+    case 0xA9: case 0xA2: case 0xA0: case 0xD0: return 1;     // imm / rel
+    case 0xAD: case 0x8D: case 0x6D: case 0xAE:
+    case 0xAC: case 0xEC: case 0xEE: return 2;                // abs
+    case 0xEA: case 0x00: case 0xFF: return 0;                // none
+    default: return -1;
+  }
+}
+
+// Tokenize to strict 2-hex-digit bytes (supports "A9 01" or "A901")
+function parseHexProgramStrict(text: string): { ok: true; bytes: number[] } | { ok: false; error: string } {
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: false, error: "No opcodes: the program text area is empty." };
+
+  const parts = trimmed.split(/[^0-9a-fA-F]/g).filter(Boolean);
+  const normalized: string[] = [];
+
+  if (parts.length === 1 && parts[0].length > 2) {
+    const s = parts[0];
+    if (s.length % 2 !== 0) return { ok: false, error: "Odd number of hex digits; bytes must be 2 hex digits each." };
+    for (let i = 0; i < s.length; i += 2) normalized.push(s.slice(i, i + 2));
+  } else {
+    normalized.push(...parts);
+  }
+
+  if (normalized.length === 0) return { ok: false, error: "No opcodes found. Paste hex like: A9 01 8D 00 00 00" };
+
+  for (const t of normalized) {
+    if (t.length !== 2 || !/^[0-9a-fA-F]{2}$/.test(t)) {
+      return { ok: false, error: `Bad byte "${t}". Use exactly two hex digits per byte (e.g., A9, 0A, FF).` };
+    }
+  }
+
+  const bytes = normalized.map(t => parseInt(t, 16) & 0xFF);
+  return { ok: true, bytes };
+}
+
+// Validate opcode set, operand completeness, size, optional BRK requirement
+function validateTsosProgram(bytes: number[], requireBrk = false): { ok: true } | { ok: false; error: string } {
+  if (bytes.length === 0) return { ok: false, error: "No opcodes found." };
+
+  let i = 0;
+  let sawBrk = false;
+
+  // Validate instruction stream ONLY up to (and including) the first BRK (00)
+  while (i < bytes.length) {
+    const op = bytes[i];
+
+    // allow data after first BRK
+    if (op === 0x00) {             // BRK
+      sawBrk = true;
+      i += 1;                       // consume BRK
+      break;                        // stop validating code — the rest is data
+    }
+
+    if (!TSOS_ALLOWED_OPCODES.has(op)) {
+      const hex = op.toString(16).toUpperCase().padStart(2, "0");
+      return { ok: false, error: `Invalid opcode ${hex} at byte ${i}.` };
+    }
+    const need = _tsosOperandBytes(op);
+    if (need < 0) {
+      const hex = op.toString(16).toUpperCase().padStart(2, "0");
+      return { ok: false, error: `Unsupported opcode ${hex} at byte ${i}.` };
+    }
+    const end = i + 1 + need;
+    if (end > bytes.length) {
+      const hex = op.toString(16).toUpperCase().padStart(2, "0");
+      return { ok: false, error: `Opcode ${hex} at byte ${i} is missing ${end - bytes.length} operand byte(s).` };
+    }
+    i = end;
+  }
+
+  if (requireBrk && !sawBrk) {
+    return { ok: false, error: "Program must contain 00 (BRK) before any data region." };
+  }
+
+  // Still enforce per-segment size
+  if (bytes.length > 256) {
+    return { ok: false, error: `Program too large (${bytes.length} bytes). Max per segment is 256.` };
+  }
+  return { ok: true };
+}
+
+
+module TSOS {
+    export class Shell {
+        // Properties
+        public promptStr = ">";
+        public commandList = [];
+        public curses = "[fuvg],[cvff],[shpx],[phag],[pbpxfhpxre],[zbgureshpxre],[gvgf]";
+        public apologies = "[sorry]";
+
+        constructor() {
+        }
+
+        public init() {
+            var sc: ShellCommand;
+            //
+            // Load the command list.
+
+            // date
+            sc = new ShellCommand(this.shellDate,
+                            "date",
+                            "- Displays the current date and time.");
+            this.commandList[this.commandList.length] = sc;
+
+            // whereami
+            sc = new ShellCommand(this.shellWhereAmI, 
+                            "whereami",
+                            "- Displays the user's current location.");
+            this.commandList[this.commandList.length] = sc;
+
+            // status <string>
+            sc = new ShellCommand(this.shellStatus,
+                                "status", 
+                                "<string> - Sets the status message shown on the task bar.");
+            this.commandList[this.commandList.length] = sc;
+
+            // bsod (test kernel trap UI)
+            sc = new ShellCommand(this.shellBsod,
+                                "bsod",
+                                "- Triggers a kernel error to display the BSOD message.");
+            this.commandList[this.commandList.length] = sc;
+
+            // load (validate textarea as hex)
+            sc = new ShellCommand(this.shellLoad, 
+                                "load",
+                                "- Validates program input (hex digits and spaces only).");
+            this.commandList[this.commandList.length] = sc;
+
+            this.commandList.push(new TSOS.ShellCommand(this.shellRun, 
+                                "run",
+                                "<pid> - Run a program loaded in memory"));
+
+
+            // creative command: fortune
+            sc = new ShellCommand(this.shellFortune,
+                                 "fortune",
+                                 "- Prints a random fortune.");
+            this.commandList[this.commandList.length] = sc;
+            // ver
+            sc = new ShellCommand(this.shellVer,
+                                  "ver",
+                                  "- Displays the current version data.");
+            this.commandList[this.commandList.length] = sc;
+
+            // help
+            sc = new ShellCommand(this.shellHelp,
+                                  "help",
+                                  "- This is the help command. Seek help.");
+            this.commandList[this.commandList.length] = sc;
+
+            // shutdown
+            sc = new ShellCommand(this.shellShutdown,
+                                  "shutdown",
+                                  "- Shuts down the virtual OS but leaves the underlying host / hardware simulation running.");
+            this.commandList[this.commandList.length] = sc;
+
+            // cls
+            sc = new ShellCommand(this.shellCls,
+                                  "cls",
+                                  "- Clears the screen and resets the cursor position.");
+            this.commandList[this.commandList.length] = sc;
+
+            // man <topic>
+            sc = new ShellCommand(this.shellMan,
+                                  "man",
+                                  "<topic> - Displays the MANual page for <topic>.");
+            this.commandList[this.commandList.length] = sc;
+
+            // trace <on | off>
+            sc = new ShellCommand(this.shellTrace,
+                                  "trace",
+                                  "<on | off> - Turns the OS trace on or off.");
+            this.commandList[this.commandList.length] = sc;
+
+            // rot13 <string>
+            sc = new ShellCommand(this.shellRot13,
+                                  "rot13",
+                                  "<string> - Does rot13 obfuscation on <string>.");
+            this.commandList[this.commandList.length] = sc;
+
+            // prompt <string>
+            sc = new ShellCommand(this.shellPrompt,
+                                  "prompt",
+                                  "<string> - Sets the prompt.");
+            this.commandList[this.commandList.length] = sc;
+
+            // drawtest
+            sc = new ShellCommand(this.shellDrawTest,
+                                    "drawtest",
+                                    "- Draws a smile to the canvas.");
+            this.commandList[this.commandList.length] = sc;
+
+            sc = new ShellCommand(this.shellClearMem,
+                                    "clearmem",
+                                    "- clear all memory segments.");
+            this.commandList[this.commandList.length] = sc;
+
+            sc = new ShellCommand(this.shellRunAll,
+                                    "runall",
+                                    "- run all loaded programs");
+            this.commandList[this.commandList.length] = sc;     
+            
+            sc = new ShellCommand(this.shellPs,
+                                    "ps",
+                                    "- list PIDs and statess");
+            this.commandList[this.commandList.length] = sc;              
+
+            sc = new ShellCommand(this.shellKill,
+                                    "kill",
+                                    "<pid> - kill one process");
+            this.commandList[this.commandList.length] = sc;
+                        
+            sc = new ShellCommand(this.shellKillAll,
+                                    "killall",
+                                    "- kill all processes");
+            this.commandList[this.commandList.length] = sc;
+                        
+            sc = new ShellCommand(this.shellQuantum,
+                                    "q",
+                                    "<int> - set RR quantum (cycles)");
+            this.commandList[this.commandList.length] = sc;
+            // format
+            sc = new ShellCommand(this.shellFormat,
+                                    "format",
+                                    "- Initializes the disk.");
+            this.commandList[this.commandList.length] = sc;
+
+            // create <filename>
+            sc = new ShellCommand(this.shellCreate,
+                                    "create",
+                                    "<filename> - Creates a file.");
+            this.commandList[this.commandList.length] = sc;
+
+            // read <filename>
+            sc = new ShellCommand(this.shellRead,
+                                    "read",
+                                    "<filename> - Reads a file.");
+            this.commandList[this.commandList.length] = sc;
+
+            // write <filename> "data"
+            sc = new ShellCommand(this.shellWrite,
+                                    "write",
+                                    "<filename> \"text\" - Writes ASCII text to a file.");
+            this.commandList[this.commandList.length] = sc;
+
+            // delete <filename>
+            sc = new ShellCommand(this.shellDelete,
+                                    "delete",
+                                    "<filename> - Deletes a file.");
+            this.commandList[this.commandList.length] = sc;
+
+            // ls
+            sc = new ShellCommand(this.shellLs,
+                                    "ls",
+                                    "- Lists root directory files.");
+            this.commandList[this.commandList.length] = sc;
+            // rename <old> <new>
+            sc = new ShellCommand(this.shellRename,
+                                    "rename",
+                                    "<old> <new> - Rename a file.");
+              this.commandList[this.commandList.length] = sc;
+
+            // copy <src> <dst>
+            sc = new ShellCommand(this.shellCopy,
+                                    "copy",
+                                    "<src> <dst> - Copy a file.");
+            this.commandList[this.commandList.length] = sc;
+
+
+            
+
+            // ps  - list the running processes and their IDs
+            // kill <id> - kills the specified process id.
+
+            // Display the initial prompt.
+            this.putPrompt();
+        }
+
+        public shellDrawTest(args: string[]): void {
+        _StdOut.clearScreen();
+        _StdOut.resetXY();
+
+        const textToDraw = args.length ? args.join(" ") : "Hello ☺";
+
+        if (_DrawingContext) {
+            // Use the vector text functions (supports your custom symbols)
+            const ctx = _DrawingContext as any;  // drawText is attached at runtime
+            ctx.drawText("sans", 20, 50, 200, textToDraw);
+        }
+
+        _StdOut.putText('Drew text: "' + textToDraw + '"');
+        }
+
+
+
+
+        public putPrompt() {
+            _StdOut.putText(this.promptStr);
+        }
+
+        public handleInput(buffer) {
+            _Kernel.krnTrace("Shell Command~" + buffer);
+            //
+            // Parse the input...
+            //
+            var userCommand = this.parseInput(buffer);
+            // ... and assign the command and args to local variables.
+            var cmd = userCommand.command;
+            var args = userCommand.args;
+            //
+            // Determine the command and execute it.
+            //
+            // TypeScript/JavaScript may not support associative arrays in all browsers so we have to iterate over the
+            // command list in attempt to find a match. 
+            // TODO: Is there a better way? Probably. Someone work it out and tell me in class.
+            var index: number = 0;
+            var found: boolean = false;
+            var fn = undefined;
+            while (!found && index < this.commandList.length) {
+                if (this.commandList[index].command === cmd) {
+                    found = true;
+                    fn = this.commandList[index].func;
+                } else {
+                    ++index;
+                }
+            }
+            if (found) {
+                this.execute(fn, args);  // Note that args is always supplied, though it might be empty.
+            } else {
+                // It's not found, so check for curses and apologies before declaring the command invalid.
+                if (this.curses.indexOf("[" + Utils.rot13(cmd) + "]") >= 0) {     // Check for curses.
+                    this.execute(this.shellCurse);
+                } else if (this.apologies.indexOf("[" + cmd + "]") >= 0) {        // Check for apologies.
+                    this.execute(this.shellApology);
+                } else { // It's just a bad command. {
+                    this.execute(this.shellInvalidCommand);
+                }
+            }
+        }
+
+        // Note: args is an optional parameter, ergo the ? which allows TypeScript to understand that.
+        public execute(fn, args?) {
+            _StdOut.advanceLine();
+            fn.call(this, args);                
+            if (_StdOut.currentXPosition > 0) _StdOut.advanceLine();
+            this.putPrompt();
+
+        }
+
+        public parseInput(buffer: string): UserCommand {
+            var retVal = new UserCommand();
+
+            // 1. Remove leading and trailing spaces.
+            buffer = Utils.trim(buffer);
+
+            // 2. Lower-case it.
+            buffer = buffer.toLowerCase();
+
+            // 3. Separate on spaces so we can determine the command and command-line args, if any.
+            var tempList = buffer.split(" ");
+
+            // 4. Take the first (zeroth) element and use that as the command.
+            var cmd = tempList.shift();  // Yes, you can do that to an array in JavaScript. See the Queue class.
+            // 4.1 Remove any left-over spaces.
+            cmd = Utils.trim(cmd);
+            // 4.2 Record it in the return value.
+            retVal.command = cmd;
+
+            // 5. Now create the args array from what's left.
+            for (var i in tempList) {
+                var arg = Utils.trim(tempList[i]);
+                if (arg != "") {
+                    retVal.args[retVal.args.length] = tempList[i];
+                }
+            }
+            return retVal;
+        }
+
+        //
+        // Shell Command Functions. Kinda not part of Shell() class exactly, but
+        // called from here, so kept here to avoid violating the law of least astonishment.
+        //
+
+        
+        
+            private shellRun = (args: string[]) => {
+  // If a PID was specified, enqueue only that one; else run all.
+  if (args.length > 0) {
+    const pid = parseInt(args[0], 10);
+    if (!Number.isFinite(pid)) { _StdOut.putText("run: pid must be a number"); _StdOut.advanceLine(); return; }
+
+    // Find the PCB (look in Kernel.processTable or your scheduler's resident list)
+    let pcb: TSOS.PCB | undefined;
+    if (TSOS.Kernel.processTable?.has(pid)) {
+      pcb = TSOS.Kernel.processTable.get(pid)!;
+    } else {
+      // fallback: seek in scheduler snapshot/residents if you keep them private
+      const snap = _Scheduler.snapshot();
+      const row = snap.find(r => r.pid === pid);
+      if (row) {
+        // we need the actual PCB object; if snapshot doesn’t return objects,
+        // track your resident list in Scheduler and expose a getter.
+        pcb = ( _Scheduler as any ).resident?.find((p: TSOS.PCB) => p.pid === pid);
+      }
+    }
+
+    if (!pcb || pcb.state === "Terminated") {
+      _StdOut.putText(`run: no such live pid ${pid}`);
+      _StdOut.advanceLine();
+      return;
+    }
+
+    _Scheduler.enqueueReady(pcb);
+    _StdOut.putText(`run: started pid ${pid}`);
+    _StdOut.advanceLine();
+
+  } else {
+    _Scheduler.runAll();
+    _StdOut.putText("run: started (all ready programs)");
+    _StdOut.advanceLine();
+  }
+};
+
+
+            
+        public shellInvalidCommand() {
+            _StdOut.putText("Invalid Command. ");
+            if (_SarcasticMode) {
+                _StdOut.putText("Unbelievable. You, [Joseph],");
+                _StdOut.advanceLine();
+                _StdOut.putText("must be the pride of [Marist].");
+            } else {
+                _StdOut.putText("Type 'help' for, well... help.");
+            }
+        }
+
+        public shellCurse() {
+            _StdOut.putText("Oh, so that's how it's going to be, eh? Fine.");
+            _StdOut.advanceLine();
+            _StdOut.putText("Bitch.");
+            _SarcasticMode = true;
+        }
+
+        public shellApology() {
+           if (_SarcasticMode) {
+              _StdOut.putText("I think we can put our differences behind us.");
+              _StdOut.advanceLine();
+              _StdOut.putText("For science . . . You monster.");
+              _SarcasticMode = false;
+           } else {
+              _StdOut.putText("For what?");
+           }
+        }
+
+        // Although args is unused in some of these functions, it is always provided in the 
+        // actual parameter list when this function is called, so I feel like we need it.
+
+        public shellVer(args: string[]) {
+            _StdOut.putText(APP_NAME + " version " + APP_VERSION);
+        }
+
+        public shellHelp(args: string[]) {
+            _StdOut.putText("Commands:");
+            for (var i in _OsShell.commandList) {
+                _StdOut.advanceLine();
+                _StdOut.putText("  " + _OsShell.commandList[i].command + " " + _OsShell.commandList[i].description);
+            }
+        }
+
+        public shellShutdown(args: string[]) {
+                _StdOut.putText("Shutting down...");
+             // Call Kernel shutdown routine.
+            _Kernel.krnShutdown();
+            // TODO: Stop the final prompt from being displayed. If possible. Not a high priority. (Damn OCD!)
+        }
+
+        public shellCls(args: string[]) {         
+            _StdOut.clearScreen();     
+            _StdOut.resetXY();
+        }
+
+        public shellDate(_args: string[]) {
+            const now = new Date();
+            _StdOut.putText(now.toLocaleString());
+        }
+
+        public shellWhereAmI(_args: string[]) {
+        // Have fun / be creative
+            _StdOut.putText("Poughkeepsie, NY (mentally at the BSOD)");
+        }
+
+        public shellStatus(args: string[]) {
+            const msg = args.join(" ").trim();
+            if (!msg) { _StdOut.putText("Usage: status <string>"); return; }
+            (window as any)._StatusMsg = msg; // taskbar reads this
+            _StdOut.putText("Status set.");
+        }
+
+        public shellBsod(_args: string[]) {
+            _Kernel.krnTrapError("Manual BSOD trigger from shell.");
+        }
+
+       public shellLoad(_args: string[]): void {
+  const ta = document.getElementById("taProgramInput") as HTMLTextAreaElement | null;
+  if (!ta) { _StdOut.putText("Error: taProgramInput not found."); return; }
+
+  // 1) Strict parse
+  const parsed = parseHexProgramStrict(ta.value);
+  if ("error" in parsed) {
+    _StdOut.putText(`Load error: ${parsed.error}`);
+    return;
+  }
+  const bytes = parsed.bytes;
+
+  // 2) Validate opcodes / operands / size
+  const v = validateTsosProgram(bytes /*, true */);
+  if ("error" in v) {
+    _StdOut.putText(`Load error: ${v.error}`);
+    return;
+  }
+
+  // 3) Create PCB first so we have a real PID
+  //    Temporary base/limit/segment; we’ll fill them in after alloc.
+  const pcb = _Scheduler.createProcess(0, 0, -1);
+
+  // 4) Try to allocate a memory segment for THIS pid
+  const alloc = _MemoryManager.allocateSegmentFor(pcb.pid);
+
+  if (alloc) {
+    // ---- Loaded into MEMORY ----
+    pcb.base    = alloc.base;
+    pcb.limit   = alloc.limit;
+    pcb.segment = alloc.segment;
+    (pcb as any).location = "Memory";
+
+    // Write program into memory
+    for (let i = 0; i < bytes.length && (alloc.base + i) <= alloc.limit; i++) {
+      _Memory.write(alloc.base + i, bytes[i]);
+    }
+
+    try { (TSOS as any).Kernel?.processTable?.set?.(pcb.pid, pcb); } catch {}
+
+    _StdOut.putText(`Loaded to memory. PID=${pcb.pid} Seg=${pcb.segment} Bytes=${bytes.length}`);
+    ta.value = "";
+    return;
+  }
+
+  // ---- No free segment: load to DISK as swap file ----
+  const fname = `proc-${pcb.pid}.swp`;
+
+  if (!_DiskDriver || typeof (_DiskDriver as any).createFile !== "function") {
+    _StdOut.putText("Load error: no free memory segments and disk driver not available.");
+    return;
+  }
+
+  // bytes -> hex -> raw bytes for writeRawDataToFile
+  const rawBytes = bytes.slice();  // writeRawDataToFile expects number[]
+
+  // ensure fresh file
+  try { (_DiskDriver as any).deleteFile?.(fname); } catch { /* ignore */ }
+  if (!_DiskDriver.createFile(fname)) {
+    _StdOut.putText(`Load error: could not create swap file ${fname}.`);
+    return;
+  }
+
+  const ok = (_DiskDriver as any).writeRawDataToFile(fname, rawBytes);
+  if (!ok) {
+    _StdOut.putText(`Load error: failed to write swap file ${fname}.`);
+    return;
+  }
+
+  // Mark PCB as disk-resident
+  (pcb as any).location = "Disk";
+  pcb.swapFilename = fname;
+  pcb.segment = -1;
+  pcb.base    = 0;
+  pcb.limit   = 0;
+
+  try { (TSOS as any).Kernel?.processTable?.set?.(pcb.pid, pcb); } catch {}
+
+  _StdOut.putText(`Loaded to disk. PID=${pcb.pid} File=${fname} Bytes=${bytes.length}`);
+  ta.value = "";
+}
+
+
+
+
+
+        public shellFortune(_args: string[]) {
+            const fortunes = [
+                "Never debug on Friday at 4:59 PM.",
+                "There is no cloud—just someone else’s computer.",
+                "Beware of off-by-one errors… tomorrow.",
+                "Ship it. Iterate. Repeat."
+            ];
+            const pick = fortunes[Math.floor(Math.random() * fortunes.length)];
+            _StdOut.putText(pick);
+        }
+
+
+        public shellMan(args: string[]) {
+        // MAN page database: command → structured info
+        const manPages: Record<string, { synopsis: string; usage: string; notes?: string[]; keywords?: string[] }> = {
+            help: {
+                synopsis: "List available commands and their usage.",
+                usage: "help [command]",
+                keywords: ["help", "commands", "usage", "man"]
+            },
+            man: {
+                synopsis: "Show manual pages. Supports partial and keyword search.",
+                usage: "man <command|keyword|\"phrase\">",
+                notes: [
+                    "Examples:",
+                    "  man help        # exact",
+                    "  man he          # partial match",
+                    "  man \"process\"   # keyword search"
+                ],
+                keywords: ["manual", "docs", "usage", "help"]
+            },
+            ver: {
+                synopsis: "Display the OS name and version.",
+                usage: "ver",
+                keywords: ["version", "os", "about"]
+            },
+                cls: {
+                synopsis: "Clear the screen and reset the cursor position.",
+                usage: "cls",
+                keywords: ["clear", "reset"]
+            },
+            shutdown: {
+                synopsis: "Shut down the virtual OS but leave the host running.",
+                usage: "shutdown",
+                keywords: ["halt", "quit"]
+            },
+            rot13: {
+                synopsis: "Perform rot13 substitution on a string.",
+                usage: "rot13 <string>",
+                keywords: ["cipher", "encode"]
+            },
+            prompt: {
+                synopsis: "Set the CLI prompt.",
+                usage: "prompt <string>",
+                keywords: ["prompt", "ps1"]
+            },
+            drawtest: {
+                synopsis: "Draw custom text (and your ☺ symbol) to the canvas.",
+                usage: "drawtest [text]",
+                notes: [ "If no text is given, prints 'Hello ☺' at coordinates (50, 200).",
+                        "Example: drawtest Operating Systems Lab 001"],
+                keywords: ["canvas", "draw", "graphics", "lab001"]       
+            },
+
+            
+
+        // TODO: add entries for new commands like date, whereami, status, load, bsod, etc.
+        };
+
+        function normalize(s: string): string {
+            return s.trim().toLowerCase();
+        }
+
+        function search(termRaw: string): string[] {
+            const term = termRaw.trim();
+            const q = normalize(term.replace(/^"(.*)"$/, "$1")); // strip quotes
+            const results: Array<[string, number]> = [];
+
+            for (const cmd of Object.keys(manPages)) {
+                const page = manPages[cmd];
+                const haystack = [
+                    page.synopsis,
+                    page.usage,
+                    ...(page.notes ?? []),
+                    ...(page.keywords ?? [])
+                ].join(" ").toLowerCase();
+
+                if (q === cmd.toLowerCase()) results.push([cmd, 100]);     // exact
+                else if (cmd.includes(q)) results.push([cmd, 70]);         // partial
+                else if (haystack.includes(q)) results.push([cmd, 40]);    // keyword
+            }
+
+            results.sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+            return results.map(([cmd]) => cmd);
+        }
+
+        if (!args.length) {
+            _StdOut.putText("MAN: Display command help. Usage: man <command|keyword|\"phrase\">");
+            return;
+        }
+
+        const term = args.join(" ");
+        const hits = search(term);
+
+        if (!hits.length) {
+            const suggestion = Object.keys(manPages).find(c =>
+                c.startsWith(term[0]?.toLowerCase() || "")
+            );
+            _StdOut.putText(`No manual entry for "${term}".` + (suggestion ? ` Did you mean "${suggestion}"?` : ""));
+            return;
+        }
+
+        const primary = hits[0];
+        const page = manPages[primary];
+        const related = hits.slice(1, 5);
+
+        _StdOut.putText(primary.toUpperCase());
+        _StdOut.advanceLine();
+        _StdOut.putText("  SYNOPSIS: " + page.synopsis);
+        _StdOut.advanceLine();
+        _StdOut.putText("  USAGE   : " + page.usage);
+        if (page.notes?.length) {
+            for (const n of page.notes) {
+                _StdOut.advanceLine();
+                _StdOut.putText("    - " + n);
+            }
+        }
+        if (related.length) {
+            _StdOut.advanceLine();
+            _StdOut.putText("  RELATED : " + related.join(", "));
+        }
+    }
+
+
+        public shellTrace(args: string[]) {
+            if (args.length > 0) {
+                var setting = args[0];
+                switch (setting) {
+                    case "on":
+                        if (_Trace && _SarcasticMode) {
+                            _StdOut.putText("Trace is already on, doofus.");
+                        } else {
+                            _Trace = true;
+                            _StdOut.putText("Trace ON");
+                        }
+                        break;
+                    case "off":
+                        _Trace = false;
+                        _StdOut.putText("Trace OFF");
+                        break;
+                    default:
+                        _StdOut.putText("Invalid arguement.  Usage: trace <on | off>.");
+                }
+            } else {
+                _StdOut.putText("Usage: trace <on | off>");
+            }
+        }
+
+        public shellRot13(args: string[]) {
+            if (args.length > 0) {
+                // Requires Utils.ts for rot13() function.
+                _StdOut.putText(args.join(' ') + " = '" + Utils.rot13(args.join(' ')) +"'");
+            } else {
+                _StdOut.putText("Usage: rot13 <string>  Please supply a string.");
+            }
+        }
+
+        public shellPrompt(args: string[]) {
+            if (args.length > 0) {
+                _OsShell.promptStr = args[0];
+            } else {
+                _StdOut.putText("Usage: prompt <string>  Please supply a string.");
+            }
+        }
+
+        private shellClearMem = (_args: string[]) => {
+  if (!_Scheduler.safeToClearMem()) {
+    _StdOut.putText("clearmem refused: at least one process is Ready or Running.");
+    return; // Shell.execute() will add newline + prompt
+  }
+
+  // Print first so the user always sees the message
+  _StdOut.putText("memory cleared.");
+
+  // Do the work
+  _CPU.isExecuting = false;
+  try { _MemoryManager.clearAll(); } catch {}
+  try { TSOS.Kernel.processTable?.clear?.(); } catch {}
+  _Scheduler.flushAll();
+
+  // (Optional) if this UI refresh tends to reset cursor, you can keep it — we'll counter below.
+  // try { TSOS.Control.refreshCpuPcbMemoryViews?.(); } catch {}
+
+  // ✅ Guarantee Shell.execute() will advance the line & re-prompt
+  // (Shell.execute does: if (_StdOut.currentXPosition > 0) _StdOut.advanceLine(); this.putPrompt();)
+  _StdOut.currentXPosition = Math.max(1, _StdOut.currentXPosition);
+
+  return; // no advanceLine() here; let Shell.execute() handle it
+};
+
+
+
+
+private shellRunAll = (_args: string[]) => {
+  _Scheduler.runAll();
+  _StdOut.putText("runall: scheduling all loaded programs.");
+  _StdOut.advanceLine();
+};
+
+private shellPs = (_args: string[]) => {
+  const rows = _Scheduler.snapshot();
+  if (!rows.length) { _StdOut.putText("no processes."); _StdOut.advanceLine(); return; }
+  rows.forEach(r => {
+    _StdOut.putText(`PID=${r.pid} State=${r.state} Seg=${r.segment} Base=${r.base.toString(16)} Limit=${r.limit.toString(16)} Q=${r.quantumRemaining}`);
+    _StdOut.advanceLine();
+  });
+};
+
+private shellKill = (args: string[]) => {
+  if (args.length < 1) { _StdOut.putText("usage: kill <pid>"); _StdOut.advanceLine(); return; }
+  const pid = parseInt(args[0], 10);
+  if (Number.isNaN(pid)) { _StdOut.putText("pid must be a number."); _StdOut.advanceLine(); return; }
+  const ok = _Scheduler.killByPid(pid);
+  _StdOut.putText(ok ? `killed ${pid}.` : `no such pid: ${pid}`);
+  _StdOut.advanceLine();
+};
+
+private shellKillAll = (_args: string[]) => {
+  _Scheduler.killAll();
+  _StdOut.putText("killed all processes.");
+  _StdOut.advanceLine();
+};
+
+private shellQuantum = (args: string[]) => {
+  if (args.length < 1) { _StdOut.putText(`quantum is ${_Scheduler.quantum}. usage: q <int>`); _StdOut.advanceLine(); return; }
+  const q = parseInt(args[0], 10);
+  if (!Number.isFinite(q) || q < 1) { _StdOut.putText("q must be a positive integer."); _StdOut.advanceLine(); return; }
+  _Scheduler.setQuantum(q);
+  _StdOut.putText(`quantum set to ${q}.`);
+  _StdOut.advanceLine();
+};
+        // ========= File system command handlers =========
+
+        private shellFormat = (_args: string[]) => {
+    if (!_DiskDriver || typeof _DiskDriver.format !== "function") {
+        _StdOut.putText("Disk driver not available.");
+        return;
+    }
+
+    const ok = _DiskDriver.format(true);   // calls DeviceDriverDisk.format
+    _StdOut.putText(ok ? "Disk formatted." : "Disk format failed.");
+    _StdOut.advanceLine();
+
+    try {
+        TSOS.Control.refreshDiskDisplay();
+    } catch { /* ignore UI errors */ }
+};
+
+
+
+
+        private shellCreate = (args: string[]): void => {
+            if (!args.length) {
+                _StdOut.putText("Usage: create <filename>");
+                return;
+            }
+            const name = args[0];
+
+            if (!_DiskDriver || !_DiskDriver.createFile) {
+                _StdOut.putText("create: disk driver not available.");
+                return;
+            }
+
+            const ok = _DiskDriver.createFile(name);
+            _StdOut.putText(ok ? `file created: ${name}` : `create: failed to create '${name}'`);
+        };
+
+        private shellWrite = (args: string[]): void => {
+  if (args.length < 2) {
+    _StdOut.putText('Usage: write <filename> "data"');
+    return;
+  }
+
+  if (!_DiskDriver || !_DiskDriver.writeFile) {
+    _StdOut.putText("write: disk driver not available.");
+    return;
+  }
+
+  const name = args[0];
+
+  // Rebuild everything after the filename into one string
+  let raw = args.slice(1).join(" ");
+
+  // Enforce quotes: must start and end with "
+  if (!(raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2)) {
+    _StdOut.putText('write: could not write to file. Data must be in double quotes, e.g.,');
+    _StdOut.advanceLine();
+    _StdOut.putText('  write ' + name + ' "your text here"');
+    return;
+  }
+
+  // Strip the surrounding quotes; use ONLY what’s between them
+  const data = raw.substring(1, raw.length - 1);
+
+  const ok = _DiskDriver.writeFile(name, data);
+  _StdOut.putText(ok ? `wrote to ${name}` : `write: failed to write '${name}'`);
+};
+
+
+        private shellRead = (args: string[]): void => {
+  if (!args.length) {
+    _StdOut.putText("Usage: read <filename>");
+    return;
+  }
+  if (!_DiskDriver || !_DiskDriver.readFile) {
+    _StdOut.putText("read: disk driver not available.");
+    return;
+  }
+
+  const name = args[0];
+  const hex: string = _DiskDriver.readFile(name);
+
+  if (!hex || hex.length === 0) {
+    _StdOut.putText(`read: '${name}' not found or empty.`);
+    return;
+  }
+
+  // convert hex from driver → ASCII text for the user
+  const text = hexToAscii(hex);
+  _StdOut.putText(text);
+};
+
+        private shellDelete = (args: string[]): void => {
+            if (!args.length) {
+                _StdOut.putText("Usage: delete <filename>");
+                return;
+            }
+            if (!_DiskDriver || !_DiskDriver.deleteFile) {
+                _StdOut.putText("delete: disk driver not available.");
+                return;
+            }
+
+            const name = args[0];
+            const ok = _DiskDriver.deleteFile(name);
+            _StdOut.putText(ok ? `deleted ${name}` : `delete: '${name}' not found.`);
+        };
+
+        private shellLs = (args: string[]): void => {
+            if (!_DiskDriver || !_DiskDriver.listFiles) {
+                _StdOut.putText("ls: disk driver not available.");
+                return;
+            }
+
+            const showAll = args.length > 0 && args[0] === "-a";
+            const files = _DiskDriver.listFiles(showAll) || [];
+
+            if (!files.length) {
+                _StdOut.putText("(no files)");
+                return;
+            }
+
+            for (const f of files) {
+                // expect objects like { name, size, creationDate }
+                _StdOut.putText(`${f.name}  ${f.size ?? "?"}B  ${f.creationDate ?? ""}`);
+                _StdOut.advanceLine();
+            }
+        };
+
+        private shellRename = (args: string[]): void => {
+            if (args.length < 2) {
+                _StdOut.putText("Usage: rename <old> <new>");
+                return;
+            }
+            if (!_DiskDriver || !_DiskDriver.renameFile) {
+                _StdOut.putText("rename: disk driver not available.");
+                return;
+            }
+
+            const [oldName, newName] = args;
+            const ok = _DiskDriver.renameFile(oldName, newName);
+            _StdOut.putText(ok ? `renamed ${oldName} -> ${newName}` :
+                                  `rename: failed to rename '${oldName}'`);
+        };
+
+        private shellCopy = (args: string[]): void => {
+            if (args.length < 2) {
+                _StdOut.putText("Usage: copy <src> <dst>");
+                return;
+            }
+            if (!_DiskDriver || !_DiskDriver.copyFile) {
+                _StdOut.putText("copy: disk driver not available.");
+                return;
+            }
+
+            const [src, dst] = args;
+            const ok = _DiskDriver.copyFile(src, dst);
+            _StdOut.putText(ok ? `copied ${src} -> ${dst}` :
+                                  `copy: failed to copy '${src}'`);
+        };
+
+
+
+    }
+}

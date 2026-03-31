@@ -1,0 +1,419 @@
+
+module TSOS {
+  export class Scheduler {
+    public quantum = 6;
+    private ready: Queue = new Queue();
+    private resident: PCB[] = [];
+    private current: PCB | null = null;
+    private nextPid = 1;
+
+    /* ---------- public API ---------- */
+    public getCurrentPcb(): PCB | null { return this.current; }
+    public setQuantum(q: number) { this.quantum = Math.max(1, q | 0); }
+
+    public createProcess(base: number, limit: number, segment: number): PCB {
+      const pcb = new PCB(this.nextPid++);
+      pcb.base = base; pcb.limit = limit; pcb.segment = segment;
+      pcb.pc = 0x00;        // start at logical 0
+      pcb.state = "Resident";
+      pcb.quantumRemaining = this.quantum;
+      pcb.cyclesTotal = 0;
+      pcb.cyclesWaiting = 0;
+      pcb.createdAt = _OSclock;
+      pcb.finishedAt = null;
+
+  pcb.location = "Memory";  
+
+
+      this.resident.push(pcb);
+      return pcb;
+    }
+
+    public enqueueReady(pcb: PCB): void {
+  pcb.state = "Ready";
+  pcb.quantumRemaining = this.quantum;
+  this.ready.enqueue(pcb);
+
+  // If the CPU is idle and nothing is current, start running right away.
+  if (!this.current && !_CPU.isExecuting) {
+    this.dispatchIfIdle();   // calls contextSwitchToNext()
+  }
+}
+
+
+    public runAll(): void {
+  for (const pcb of this.resident) {
+    if (pcb.state !== "Terminated") this.enqueueReady(pcb);
+  }
+  this.dispatchIfIdle();
+}
+
+    public onInstructionCompleted(cyclesConsumed: number): void {
+  if (!this.current) return;
+  this.current.cyclesTotal += cyclesConsumed;
+
+  // increment wait time for everyone in ready queue
+  const tmp = new Queue();
+  while (!this.ready.isEmpty()) {
+    const p = this.ready.dequeue()!;
+    p.cyclesWaiting += cyclesConsumed;
+    tmp.enqueue(p);
+  }
+  this.ready = tmp;
+
+  // quantum tick
+  this.current.quantumRemaining -= cyclesConsumed;
+  if (this.current.quantumRemaining <= 0) {
+    _Kernel.krnTrace(`RR: quantum expired for PID=${this.current.pid}`);
+    _KernelInterruptQueue.enqueue(new Interrupt(CONTEXT_SWITCH_IRQ, []));
+  }
+}
+
+
+public getResident(): PCB[] { return this.resident.slice(); }
+
+
+  public markCurrentTerminated(): void {
+  if (!this.current) return;
+
+  const pcb = this.current;
+
+  // --- Mark as finished ---
+  pcb.state = "Terminated";
+  pcb.finishedAt = _OSclock;
+
+  // turnaround = running time + waiting time (in CPU-cycle units)
+  const turnaround = pcb.cyclesTotal + pcb.cyclesWaiting;
+  const waiting    = pcb.cyclesWaiting;
+
+  // Print immediately to the console
+  _StdOut.putText(
+    `PID=${pcb.pid} finished. Turnaround=${turnaround} cycles, Wait=${waiting} cycles.`
+  );
+  _StdOut.advanceLine();
+
+  // --- Free its memory segment if resident ---
+  // Free memory iff resident
+if (pcb.location === "Memory") {
+  _MemoryManager.freeByPid(pcb.pid);
+}
+
+// Delete swap file ONLY if still on disk
+if (pcb.location === "Disk" && pcb.swapFilename && _DiskDriver?.deleteFile) {
+  try { _DiskDriver.deleteFile(pcb.swapFilename); } catch {}
+  pcb.swapFilename = null;
+}
+
+
+  // Update PCB / ready queue display
+  TSOS.Control.updatePcbTable(pcb);   // ✅ 1 argument
+  TSOS.Control.updateReadyQueue();
+
+  // Clear current and move on to the next process
+  this.current = null;
+  this.contextSwitchToNext();
+}
+
+
+
+    public killByPid(pid: number): boolean {
+      // current
+      if (this.current && this.current.pid === pid) {
+        this.markCurrentTerminated();
+        return true;
+      }
+      // ready queue
+      let killed = false;
+      const tmp = new Queue();
+      while (!this.ready.isEmpty()) {
+        const p = this.ready.dequeue()!;
+        if (p.pid === pid) {
+  p.state = "Terminated";
+
+  if (p.location === "Memory") {
+  _MemoryManager.freeByPid(pid);
+}
+if (p.location === "Disk" && p.swapFilename && _DiskDriver?.deleteFile) {
+  try { _DiskDriver.deleteFile(p.swapFilename); } catch {}
+  p.swapFilename = null;
+}
+
+
+  killed = true;
+} else {
+  tmp.enqueue(p);
+}
+
+      }
+      this.ready = tmp;
+      return killed;
+    }
+
+    public killAll(): void {
+  // stop CPU if anything was running
+  _CPU.isExecuting = false;                   // <-- critical
+
+if (this.current) {
+  this.current.state = "Terminated";
+
+  if (this.current.location === "Memory") {
+    _MemoryManager.freeByPid(this.current.pid);
+  }
+  if (this.current.location === "Disk" && this.current.swapFilename && _DiskDriver?.deleteFile) {
+    try { _DiskDriver.deleteFile(this.current.swapFilename); } catch {}
+    this.current.swapFilename = null;
+  }
+
+  this.current = null;
+}
+
+while (!this.ready.isEmpty()) {
+  const p = this.ready.dequeue()!;
+  p.state = "Terminated";
+
+  if (p.location === "Memory") {
+    _MemoryManager.freeByPid(p.pid);
+  }
+  if (p.location === "Disk" && p.swapFilename && _DiskDriver?.deleteFile) {
+    try { _DiskDriver.deleteFile(p.swapFilename); } catch {}
+    p.swapFilename = null;
+  }
+}
+
+
+}
+
+
+    public snapshot(): Array<{ pid:number; state:string; segment:number; base:number; limit:number; priority:number; quantumRemaining:number; }> {
+      const set = new Map<number, PCB>();
+      if (this.current) set.set(this.current.pid, this.current);
+      // copy ready
+      const tmp = new Queue(); while(!this.ready.isEmpty()){ const p=this.ready.dequeue()!; set.set(p.pid,p); tmp.enqueue(p); } this.ready=tmp;
+      // include residents
+      for (const r of this.resident) if (!set.has(r.pid)) set.set(r.pid, r);
+      return [...set.values()].map(p => ({
+        pid: p.pid, state: p.state, segment: p.segment, base: p.base, limit: p.limit,
+        priority: p.priority, quantumRemaining: p.quantumRemaining
+      }));
+    }
+
+    /* ---------- dispatch/CS ---------- */
+    private dispatchIfIdle(): void { if (!this.current) this.contextSwitchToNext(); }
+  private chooseSwapVictim(exclude: PCB): PCB | null {
+  const candidates: PCB[] = [];
+
+  const tmp = new Queue();
+  while (!this.ready.isEmpty()) {
+    const p = this.ready.dequeue()!;
+    tmp.enqueue(p);
+
+    _Kernel.krnTrace(
+      `RR: victim-scan sees PID=${p.pid} state=${p.state} loc=${p.location} seg=${p.segment}`
+    );
+
+    if (p !== exclude && p.location === "Memory" && p.state === "Ready") {
+      candidates.push(p);
+    }
+  }
+  this.ready = tmp;
+
+  if (candidates.length > 0) {
+    _Kernel.krnTrace(`RR: chooseSwapVictim -> PID=${candidates[0].pid}`);
+    return candidates[0];
+  }
+
+  if (this.current &&
+      this.current !== exclude &&
+      this.current.location === "Memory" &&
+      this.current.state !== "Terminated") {
+    _Kernel.krnTrace(`RR: chooseSwapVictim (fallback current) -> PID=${this.current.pid}`);
+    return this.current;
+  }
+
+  _Kernel.krnTrace(`RR: chooseSwapVictim -> no victim for PID=${exclude.pid}`);
+  return null;
+}
+
+  
+
+private contextSwitchToNext(): void {
+  const next = this.ready.dequeue();
+
+  if (!next) {
+    this.current = null;
+    _CPU.isExecuting = false;
+    _Kernel.krnTrace("RR: no runnable processes");
+    return;
+  }
+
+    // --- Project 4 swap-in logic (simplified & safe) ---
+   // --- Project 4 swap-in logic: delegate to ensureInMemory() ---
+  if (next.location === "Disk") {
+    _Kernel.krnTrace(`RR: attempting swap-in for PID=${next.pid}`);
+
+    const ok = this.ensureInMemory(next);   // <-- tries free segment first; otherwise victim; returns false on failure
+    if (!ok) {
+      // Couldn’t bring it in now — do NOT drop it. Re-enqueue and try someone else if available.
+      this.ready.enqueue(next);
+
+      if (this.ready.getSize() > 0) {
+        // Try another PCB this tick; bounded because we only added back one.
+        this.contextSwitchToNext();
+      } else {
+        // Nothing else runnable — idle until memory frees.
+        this.current = null;
+        _CPU.isExecuting = false;
+        _Kernel.krnTrace("RR: only ready PID is on disk and can’t swap now; CPU idling.");
+      }
+      return;
+    }
+    // If ok === true, pcb is now resident; fall through to your normal dispatch below.
+  }
+
+
+  // --- normal dispatch logic ---
+  this.current = next;
+  next.state = "Running";
+  next.quantumRemaining = this.quantum;
+
+  _CPU.PC    = next.pc;
+  _CPU.Acc   = next.acc;
+  _CPU.Xreg  = next.x;
+  _CPU.Yreg  = next.y;
+  _CPU.Zflag = next.z;
+
+  _CPU.isExecuting = true;
+  TSOS.Kernel.setCurrent?.(next.pid);
+  _Kernel.krnTrace(`RR: dispatched PID=${next.pid}`);
+}
+
+
+private ensureInMemory(pcb: PCB): boolean {
+  // Already resident
+  if (pcb.location === "Memory") return true;
+
+  // Swapper presence check (defensive)
+  const swapper: any = (TSOS as any).Swapper;
+  const hasRollIn  = !!swapper && typeof swapper.rollIn  === "function";
+  const hasRollOut = !!swapper && typeof swapper.rollOut === "function";
+  if (!hasRollIn || !hasRollOut) {
+    _Kernel.krnTrace(`RR: Swapper unavailable; cannot swap in PID=${pcb.pid}.`);
+    return false;
+  }
+
+  // 1) Try a truly free segment first (no eviction).
+  const freeSeg = _MemoryManager.getFirstFreeSegment();
+  if (freeSeg !== null) {
+    // Reserve it for this PID (race-safe)
+    const reserved = _MemoryManager.reserveSegmentFor(pcb.pid, freeSeg);
+    if (!reserved) {
+      // another racer grabbed it; fall through to victim path
+      _Kernel.krnTrace(`RR: race reserving seg=${freeSeg} for PID=${pcb.pid}; trying victim path.`);
+    } else {
+      // Some swapper.rollIn implementations want the target segment,
+      // others infer from pcb.segment. Support both without compile errors.
+      pcb.segment = reserved.segment;
+      pcb.base    = reserved.base;
+      pcb.limit   = reserved.limit;
+
+      try {
+        if (swapper.rollIn.length >= 2) {
+          // rollIn(pcb, segment)
+          if (!swapper.rollIn(pcb, reserved.segment)) throw new Error("rollIn failed");
+        } else {
+          // rollIn(pcb) and it uses pcb.segment
+          if (!swapper.rollIn(pcb)) throw new Error("rollIn failed");
+        }
+      } catch (e) {
+        // Undo reservation on failure so others can use the segment
+        _Kernel.krnTrace(`RR: rollIn error for PID=${pcb.pid} on seg=${reserved.segment}: ${e}`);
+        _MemoryManager.freeByPid(pcb.pid);
+        return false;
+      }
+
+      pcb.location = "Memory";
+      return true;
+    }
+  }
+
+// 2) No free segment — pick a victim.
+const victim = this.chooseSwapVictim(pcb);
+if (!victim) { _Kernel.krnTrace(`RR: ensureInMemory -> no victim for PID=${pcb.pid}`); return false; }
+
+// capture BEFORE rollOut (rollOut sets segment = -1)
+const oldSeg   = victim.segment!;
+const oldBase  = victim.base;
+const oldLimit = victim.limit;
+
+// roll victim out to disk (this frees its memory)
+if (!(TSOS as any).Swapper.rollOut(victim)) {
+  _Kernel.krnTrace(`RR: rollOut failed for victim PID=${victim.pid}`);
+  return false;
+}
+
+// reserve the same segment for the incoming pcb
+const reserved = _MemoryManager.reserveSegmentFor(pcb.pid, oldSeg);
+if (!reserved) {
+  _Kernel.krnTrace(`RR: reserve failed for seg=${oldSeg} after rollOut`);
+  // optional: try to restore owner: _MemoryManager.reserveSegmentFor(victim.pid, oldSeg);
+  return false;
+}
+
+// set where we plan to load it (helps UIs/debug)
+pcb.segment = reserved.segment;
+pcb.base    = reserved.base;
+pcb.limit   = reserved.limit;
+
+// roll in using the *target* segment
+if (!(TSOS as any).Swapper.rollIn(pcb, reserved.segment)) {
+  _Kernel.krnTrace(`RR: rollIn failed for PID=${pcb.pid} into seg=${reserved.segment}`);
+  _MemoryManager.freeByPid(pcb.pid);   // undo reservation
+  return false;
+}
+
+pcb.location = "Memory";
+return true;
+}
+
+
+
+
+
+  public handleContextSwitch(): void {
+  if (this.current && this.current.state !== "Terminated") {
+    this.current.state = "Ready";
+    this.current.quantumRemaining = this.quantum;   // reset
+    this.ready.enqueue(this.current);
+  }
+  this.contextSwitchToNext();
+}
+public safeToClearMem(): boolean {
+  // We can clear memory if NO process is currently Ready or Running
+  const active = 
+    (this.current && (this.current.state === "Running" || this.current.state === "Ready")) ||
+    this.resident.some(p => p.state === "Running" || p.state === "Ready");
+  return !active;
+}
+public flushAll(): void {
+  // Clean up swap files for any known PCBs
+  for (const pcb of this.resident) {
+  if (pcb.location === "Disk" && pcb.swapFilename && _DiskDriver?.deleteFile) {
+    try { _DiskDriver.deleteFile(pcb.swapFilename); } catch {}
+    pcb.swapFilename = null;
+  }
+}
+
+
+  this.current = null;
+  this.ready = new Queue();
+  this.resident = [];
+  // optional: this.nextPid = 1;   // if you want PIDs to reset
+}
+
+
+  }
+}
+
+
+
+

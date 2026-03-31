@@ -1,0 +1,261 @@
+var TSOS;
+(function (TSOS) {
+    const BLOCK_SIZE = 64; // bytes
+    const HEADER = 4; // inUse(1) + next (3) -> "t:s:b"
+    const PAYLOAD = BLOCK_SIZE - HEADER;
+    const TRACKS = 4, SECTORS = 8, BLOCKS = 8; // 4*8*8 = 256 blocks total
+    function key(tsb) { return `${tsb.t}:${tsb.s}:${tsb.b}`; }
+    function fromKey(k) { const [t, s, b] = k.split(":").map(n => +n); return { t, s, b }; }
+    function isDir(tsb) { return tsb.t === 0; }
+    function hexFromAscii(s) {
+        return Array.from(s).map(ch => ch.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+    }
+    function asciiFromHex(h) {
+        const pairs = h.match(/.{1,2}/g) ?? [];
+        return pairs.map(p => String.fromCharCode(parseInt(p, 16))).join("");
+    }
+    class DeviceDriverDisk extends TSOS.DeviceDriver {
+        constructor() {
+            super();
+            this.driverEntry = this.diskDriverEntry;
+        }
+        diskDriverEntry = () => {
+            this.initLayout();
+            this.status = "disk driver loaded";
+        };
+        // ============ Public API ============
+        format(full = true) {
+            for (let t = 0; t < TRACKS; t++)
+                for (let s = 0; s < SECTORS; s++)
+                    for (let b = 0; b < BLOCKS; b++) {
+                        const k = `${t}:${s}:${b}`;
+                        sessionStorage.setItem(k, this.emptyBlock());
+                    }
+            // Make directory blocks reserved (still “free” payload, but exist)
+            return true;
+        }
+        create(name) {
+            if (!name)
+                return false;
+            if (this.dirFind(name))
+                return false; // already exists
+            const d = this.dirCreate(name, name.startsWith("."));
+            return !!d;
+        }
+        read(name) {
+            const ent = this.dirFind(name);
+            if (!ent || !ent.dataHead)
+                return null;
+            const hex = this.readChain(ent.dataHead);
+            return asciiFromHex(hex);
+        }
+        write(name, data) {
+            const ent = this.dirFind(name) || this.dirCreate(name, name.startsWith("."));
+            if (!ent)
+                return false;
+            // free old chain if present
+            if (ent.dataHead)
+                this.freeChain(ent.dataHead);
+            const hex = hexFromAscii(data);
+            const head = this.allocBlock(false);
+            if (!head)
+                return false;
+            if (!this.writeChain(head, hex)) {
+                this.freeChain(head);
+                return false;
+            }
+            // put head pointer into directory entry
+            this.setNext(this.block(ent.tsb), head);
+            this.persist(ent.tsb, this.block(ent.tsb));
+            return true;
+        }
+        delete(name) {
+            return this.dirDelete(name);
+        }
+        copy(src, dst) {
+            const data = this.read(src);
+            if (data == null)
+                return false;
+            if (!this.dirFind(dst))
+                this.create(dst);
+            return this.write(dst, data);
+        }
+        rename(oldName, newName) {
+            const ent = this.dirFind(oldName);
+            if (!ent || this.dirFind(newName))
+                return false;
+            const blk = this.block(ent.tsb);
+            // rewrite filename in payload
+            const meta = (blk.payload ?? "");
+            // filename is at start of payload until first 00 (or all)
+            const newHex = hexFromAscii(newName).slice(0, PAYLOAD * 2);
+            blk.payload = newHex.padEnd(PAYLOAD * 2, "0");
+            this.persist(ent.tsb, blk);
+            return true;
+        }
+        list(includeHidden = false) {
+            const out = [];
+            for (let s = 0; s < SECTORS; s++)
+                for (let b = 0; b < BLOCKS; b++) {
+                    const tsb = { t: 0, s, b };
+                    const blk = this.block(tsb);
+                    if (!blk.inUse)
+                        continue;
+                    const name = this.readNameFromDir(blk);
+                    if (!includeHidden && name.startsWith("."))
+                        continue;
+                    const head = this.getNext(blk); // data head
+                    const bytes = head ? (this.readChain(head).length / 2) : 0;
+                    out.push({ name, size: bytes, created: "", hidden: name.startsWith(".") });
+                }
+            return out;
+        }
+        // ============ Low-level helpers ============
+        initLayout() {
+            // Create all blocks if absent
+            for (let t = 0; t < TRACKS; t++)
+                for (let s = 0; s < SECTORS; s++)
+                    for (let b = 0; b < BLOCKS; b++) {
+                        const k = `${t}:${s}:${b}`;
+                        if (sessionStorage.getItem(k) == null)
+                            sessionStorage.setItem(k, this.emptyBlock());
+                    }
+        }
+        emptyBlock() {
+            // inUse = 0, nextPtr = "0:0:0", payload = zeros
+            return JSON.stringify({ inUse: 0, next: "0:0:0", payload: "".padEnd(PAYLOAD * 2, "0") });
+        }
+        block(tsb) {
+            const raw = sessionStorage.getItem(key(tsb));
+            if (!raw)
+                return { inUse: 0, next: "0:0:0", payload: "".padEnd(PAYLOAD * 2, "0") };
+            return JSON.parse(raw);
+        }
+        persist(tsb, blk) {
+            sessionStorage.setItem(key(tsb), JSON.stringify(blk));
+        }
+        setInUse(blk, v) { blk.inUse = v ? 1 : 0; }
+        getNext(blk) {
+            const [t, s, b] = (blk.next || "0:0:0").split(":").map((n) => +n);
+            return (t | s | b) ? { t, s, b } : null;
+        }
+        setNext(blk, tsb) { blk.next = tsb ? key(tsb) : "0:0:0"; }
+        dirFind(name) {
+            for (let s = 0; s < SECTORS; s++)
+                for (let b = 0; b < BLOCKS; b++) {
+                    const tsb = { t: 0, s, b };
+                    const blk = this.block(tsb);
+                    if (!blk.inUse)
+                        continue;
+                    const nm = this.readNameFromDir(blk);
+                    if (nm === name) {
+                        return { tsb, name: nm, dataHead: this.getNext(blk), inUse: true, hidden: nm.startsWith(".") };
+                    }
+                }
+            return null;
+        }
+        readNameFromDir(blk) {
+            // filename lives in payload (ascii-hex) until 00 or payload end
+            const hex = blk.payload || "";
+            const stop = hex.indexOf("00");
+            const slice = stop >= 0 ? hex.slice(0, stop) : hex;
+            return asciiFromHex(slice);
+        }
+        dirCreate(name, hidden = false) {
+            // find free dir block
+            for (let s = 0; s < SECTORS; s++)
+                for (let b = 0; b < BLOCKS; b++) {
+                    const tsb = { t: 0, s, b };
+                    const blk = this.block(tsb);
+                    if (blk.inUse)
+                        continue;
+                    this.setInUse(blk, true);
+                    this.setNext(blk, null);
+                    const nm = hexFromAscii(name).slice(0, PAYLOAD * 2);
+                    blk.payload = nm.padEnd(PAYLOAD * 2, "0");
+                    this.persist(tsb, blk);
+                    return { tsb, name, dataHead: null, inUse: true, hidden };
+                }
+            return null;
+        }
+        dirDelete(name) {
+            const ent = this.dirFind(name);
+            if (!ent)
+                return false;
+            const blk = this.block(ent.tsb);
+            const head = this.getNext(blk);
+            if (head)
+                this.freeChain(head);
+            this.setInUse(blk, false);
+            this.setNext(blk, null);
+            blk.payload = "".padEnd(PAYLOAD * 2, "0");
+            this.persist(ent.tsb, blk);
+            return true;
+        }
+        allocBlock(allowDir) {
+            for (let t = allowDir ? 0 : 1; t < TRACKS; t++)
+                for (let s = 0; s < SECTORS; s++)
+                    for (let b = 0; b < BLOCKS; b++) {
+                        const tsb = { t, s, b };
+                        const blk = this.block(tsb);
+                        if (blk.inUse)
+                            continue;
+                        this.setInUse(blk, true);
+                        this.setNext(blk, null);
+                        blk.payload = "".padEnd(PAYLOAD * 2, "0");
+                        this.persist(tsb, blk);
+                        return tsb;
+                    }
+            return null;
+        }
+        writeChain(head, hexData) {
+            // chunk hexData into payload-size (PAYLOAD bytes => PAYLOAD*2 hex chars)
+            let cur = head;
+            let rest = hexData;
+            while (true) {
+                const blk = this.block(cur);
+                blk.payload = (rest.slice(0, PAYLOAD * 2)).padEnd(PAYLOAD * 2, "0");
+                rest = rest.slice(PAYLOAD * 2);
+                if (rest.length > 0) {
+                    const nxt = this.allocBlock(false);
+                    if (!nxt)
+                        return false;
+                    this.setNext(blk, nxt);
+                    this.persist(cur, blk);
+                    cur = nxt;
+                }
+                else {
+                    this.setNext(blk, null);
+                    this.persist(cur, blk);
+                    break;
+                }
+            }
+            return true;
+        }
+        readChain(head) {
+            let hex = "";
+            let cur = head;
+            while (cur) {
+                const blk = this.block(cur);
+                hex += (blk.payload || "");
+                cur = this.getNext(blk);
+            }
+            // trim trailing zeros added by padding
+            return hex.replace(/(00)+$/, "");
+        }
+        freeChain(head) {
+            let cur = head;
+            while (cur) {
+                const blk = this.block(cur);
+                const nxt = this.getNext(blk);
+                this.setInUse(blk, false);
+                this.setNext(blk, null);
+                blk.payload = "".padEnd(PAYLOAD * 2, "0");
+                this.persist(cur, blk);
+                cur = nxt;
+            }
+        }
+    }
+    TSOS.DeviceDriverDisk = DeviceDriverDisk;
+})(TSOS || (TSOS = {}));
+//# sourceMappingURL=deviceDriverDisk.js.map

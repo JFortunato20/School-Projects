@@ -1,0 +1,83 @@
+/* ------------
+   hardDrive.ts
+
+   Backing store representation.
+------------ */
+var TSOS;
+(function (TSOS) {
+    class HardDrive {
+        tracks = 4;
+        sectors = 8;
+        blocks = 8;
+        blockSize = 64; // bytes of DATA per block
+        driveMap = new Map();
+        /**
+         * Called from kernel bootstrap.
+         * Tries to restore from sessionStorage, otherwise does a fresh format.
+         */
+        init() {
+            const saved = sessionStorage.getItem("hardDriveStorage");
+            if (saved) {
+                try {
+                    const entries = JSON.parse(saved);
+                    this.driveMap = new Map(entries);
+                    // make sure UI is in sync
+                    this.refreshUi();
+                    return;
+                }
+                catch {
+                    // fall through to fresh format
+                }
+            }
+            this.initializeHardDrive();
+        }
+        getBlockSize() {
+            return this.blockSize;
+        }
+        getHardDriveMap() {
+            return this.driveMap;
+        }
+        /**
+         * Fresh format: creates all TSBs and clears them.
+         * MBR at 0:0:0 is marked used.
+         *
+         * NOTE: "0:0:0" is our "null pointer" / end-of-chain marker.
+         */
+        initializeHardDrive() {
+            this.driveMap = new Map();
+            for (let t = 0; t < this.tracks; t++) {
+                for (let s = 0; s < this.sectors; s++) {
+                    for (let b = 0; b < this.blocks; b++) {
+                        const key = `${t}:${s}:${b}`;
+                        const isMBR = (t === 0 && s === 0 && b === 0);
+                        this.driveMap.set(key, {
+                            used: isMBR ? 1 : 0,
+                            next: "0:0:0", // default: no next
+                            data: "".padEnd(this.blockSize, "0")
+                        });
+                    }
+                }
+            }
+            this.persist();
+        }
+        /** Save current map to sessionStorage AND update UI */
+        persist() {
+            try {
+                const arr = Array.from(this.driveMap.entries());
+                sessionStorage.setItem("hardDriveStorage", JSON.stringify(arr));
+            }
+            catch { /* ignore */ }
+            this.refreshUi();
+        }
+        refreshUi() {
+            try {
+                TSOS.Control.refreshDiskDisplay();
+            }
+            catch {
+                // UI might not be ready yet during bootstrap
+            }
+        }
+    }
+    TSOS.HardDrive = HardDrive;
+})(TSOS || (TSOS = {}));
+//# sourceMappingURL=hardDrive.js.map

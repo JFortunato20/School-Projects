@@ -1,0 +1,111 @@
+module TSOS {
+  export class MemoryManager {
+    private nextPid = 1;
+    private static readonly SEG_SIZE = 0x100; // 256
+    private owners: Array<number | null> = [null, null, null];
+
+    allocateSegmentFor(pid: number): { base: number; limit: number; segment: number } | null {
+      for (let seg = 0; seg < 3; seg++) {
+        if (this.owners[seg] === null) {
+          this.owners[seg] = pid;
+          const base = seg * MemoryManager.SEG_SIZE;
+          return { base, limit: base + MemoryManager.SEG_SIZE - 1, segment: seg };
+        }
+      }
+      return null;
+    }
+
+    freeByPid(pid: number): void {
+      for (let seg = 0; seg < 3; seg++) {
+        if (this.owners[seg] === pid) {
+          this.owners[seg] = null;
+          const base = seg * MemoryManager.SEG_SIZE;
+          for (let i = 0; i < MemoryManager.SEG_SIZE; i++) _Memory.write(base + i, 0x00);
+        }
+      }
+    }
+
+    clearAll(): void {
+      this.owners = [null, null, null];
+      for (let a = 0; a < 3 * MemoryManager.SEG_SIZE; a++) _Memory.write(a, 0x00);
+    }
+
+    anyLoaded(): boolean { return this.owners.some(o => o !== null); }
+    snapshot() { return this.owners.map((o, i) => ({ segment: i, owner: o })); }    
+
+    public loadHexAtZero(raw: string): TSOS.PCB {
+      // 1) Normalize the input: keep only hex and whitespace
+      const cleaned = (raw || "")
+        .replace(/[^0-9a-fA-F\s]/g, " ")
+        .trim();
+      if (!cleaned) throw new Error("Invalid: empty program.");
+
+      // 2) Tokenize and validate
+      const tokens = cleaned.split(/\s+/).map(s => s.toUpperCase());
+      for (const t of tokens) {
+        if (!/^[0-9A-F]{2}$/.test(t)) {
+          throw new Error(`Invalid hex byte: "${t}"`);
+        }
+      }
+
+      // 3) Clear the segment BEFORE writing
+      _Memory.clear(0x0000, 0x00FF);
+
+      // 4) Write sequentially from $0000 (cap at 256)
+      let addr = 0x0000;
+      for (const t of tokens) {
+        const v = parseInt(t, 16);
+        _MemoryAccessor.write(addr++, v);
+        if (addr > 0x00FF) break;
+      }
+
+      // 5) Create PCB in Ready state, PC at 0
+      const pcb = new TSOS.PCB(this.nextPid++);
+      pcb.base = 0x0000; pcb.limit = 0x00FF; pcb.pc = 0x0000;
+      pcb.state = "Ready";
+      return pcb;
+    }
+
+
+  // keep your existing fields...
+
+  /** Expose segment size for callers that need base/limit math */
+  public readonly SEGMENT_SIZE = MemoryManager.SEG_SIZE;
+
+  /** Return the index (0..2) of the first free segment, or null if none. */
+  public getFirstFreeSegment(): number | null {
+    for (let seg = 0; seg < this.owners.length; seg++) {
+      if (this.owners[seg] === null) return seg;
+    }
+    return null;
+  }
+
+  /** Compute base/limit for a given segment. */
+  public baseFor(seg: number): number {
+    return seg * MemoryManager.SEG_SIZE;
+  }
+  public limitFor(seg: number): number {
+    const base = this.baseFor(seg);
+    return base + MemoryManager.SEG_SIZE - 1;
+  }
+
+  /**
+   * Reserve a specific free segment for a pid (no writes/clears).
+   * Returns the computed base/limit/segment or null if that segment
+   * was not actually free (race-safety).
+   */
+  public reserveSegmentFor(pid: number, seg: number): { base: number; limit: number; segment: number } | null {
+    if (this.owners[seg] !== null) return null;
+    this.owners[seg] = pid;
+    const base  = this.baseFor(seg);
+    const limit = this.limitFor(seg);
+    return { base, limit, segment: seg };
+  }
+
+
+}
+
+
+  }
+
+var _MemoryManager: TSOS.MemoryManager = new TSOS.MemoryManager();
